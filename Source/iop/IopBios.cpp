@@ -99,6 +99,7 @@ CIopBios::CIopBios(CMIPS& cpu, uint8* ram, uint32 ramSize)
 , m_intrHandlers(reinterpret_cast<INTRHANDLER*>(&m_ram[BIOS_INTRHANDLER_BASE]), 1, MAX_INTRHANDLER)
 , m_messageBoxes(reinterpret_cast<MESSAGEBOX*>(&m_ram[BIOS_MESSAGEBOX_BASE]), 1, MAX_MESSAGEBOX)
 , m_loadedModules(reinterpret_cast<LOADEDMODULE*>(&m_ram[BIOS_LOADEDMODULE_BASE]), 1, MAX_LOADEDMODULE)
+, m_currentThreadId(reinterpret_cast<uint32*>(m_ram + BIOS_CURRENT_THREAD_ID_BASE))
 {
 	static_assert(BIOS_CALCULATED_END <= CIopBios::CONTROL_BLOCK_END, "Control block size is too small");
 }
@@ -124,7 +125,7 @@ void CIopBios::Reset(Iop::CSifMan* sifMan)
 	//0xBE00000 = Stupid constant to make FFX PSF happy
 	CurrentTime() = 0xBE00000;
 	ThreadLinkHead() = 0;
-	CurrentThreadId() = -1;
+	m_currentThreadId = -1;
 
 	m_cpu.m_State.nCOP0[CCOP_SCU::STATUS] |= CMIPS::STATUS_IE;
 
@@ -247,11 +248,6 @@ uint32& CIopBios::ThreadLinkHead() const
 	return *reinterpret_cast<uint32*>(m_ram + BIOS_THREAD_LINK_HEAD_BASE);
 }
 
-uint32& CIopBios::CurrentThreadId() const
-{
-	return *reinterpret_cast<uint32*>(m_ram + BIOS_CURRENT_THREAD_ID_BASE);
-}
-
 uint64& CIopBios::CurrentTime() const
 {
 	return *reinterpret_cast<uint64*>(m_ram + BIOS_CURRENT_TIME_BASE);
@@ -335,7 +331,7 @@ void CIopBios::InitializeModuleStarter()
 		moduleStartRequest->nextPtr = reinterpret_cast<uint8*>(moduleStartRequest + 1) - m_ram;
 	}
 
-	m_moduleStarterThreadId = CreateThread(m_moduleStarterThreadProcAddress, DEFAULT_PRIORITY, DEFAULT_STACKSIZE, 0);
+	m_moduleStarterThreadId = CreateThread(m_moduleStarterThreadProcAddress, MODULE_INIT_PRIORITY, DEFAULT_STACKSIZE, 0);
 	StartThread(m_moduleStarterThreadId, 0);
 }
 
@@ -392,7 +388,7 @@ void CIopBios::ProcessModuleStart()
 			return copyAddress;
 		};
 
-	assert(GetCurrentThreadId() == m_moduleStarterThreadId);
+	assert(m_currentThreadId == m_moduleStarterThreadId);
 
 	uint32 requestPtr = ModuleStartRequestHead();
 	assert(requestPtr != 0);
@@ -412,7 +408,7 @@ void CIopBios::ProcessModuleStart()
 		ModuleStartRequestFree() = requestPtr;
 	}
 
-	assert(GetCurrentThreadId() == m_moduleStarterThreadId);
+	assert(m_currentThreadId == m_moduleStarterThreadId);
 
 	//Reset stack pointer
 	{
@@ -667,6 +663,17 @@ int32 CIopBios::SearchModuleByName(const char* moduleName) const
 
 void CIopBios::ProcessModuleReset(const std::string& imagePath)
 {
+	unsigned int imageVersion = 1000;
+	bool found = TryGetImageVersionFromPath(imagePath, &imageVersion);
+	if(!found) found = TryGetImageVersionFromContents(imagePath, &imageVersion);
+	assert(found);
+#ifdef _IOP_EMULATE_MODULES
+	m_fileIo->SetModuleVersion(imageVersion);
+#endif
+}
+
+bool CIopBios::TryGetImageVersionFromPath(const std::string& imagePath, unsigned int* result)
+{
 	struct IMAGE_FILE_PATTERN
 	{
 		const char* start;
@@ -678,12 +685,12 @@ void CIopBios::ProcessModuleReset(const std::string& imagePath)
 		{	"DNAS",		"DNAS%d.IMG;1"		}
 	};
 
-	unsigned int imageVersion = 1000;
 	for(const auto imageFilePattern : g_imageFilePatterns)
 	{
 		auto imageFileName = strstr(imagePath.c_str(), imageFilePattern.start);
 		if(imageFileName != nullptr)
 		{
+			unsigned int imageVersion = 0;
 			auto cvtCount = sscanf(imageFileName, imageFilePattern.pattern, &imageVersion);
 			if(cvtCount == 1)
 			{
@@ -695,13 +702,49 @@ void CIopBios::ProcessModuleReset(const std::string& imagePath)
 				{
 					imageVersion = imageVersion * 10;
 				}
-				break;
+				if(result)
+				{
+					(*result) = imageVersion;
+				}
+				return true;
 			}
 		}
 	}
-#ifdef _IOP_EMULATE_MODULES
-	m_fileIo->SetModuleVersion(imageVersion);
-#endif
+	return false;
+}
+
+bool CIopBios::TryGetImageVersionFromContents(const std::string& imagePath, unsigned int* result)
+{
+	//Format of imagePath can be something like 'rom0:/UDNL cdrom0:/something;1'
+	auto imagePathStart = strstr(imagePath.c_str(), "cdrom0:");
+	if(!imagePathStart) return false;
+
+	int32 fd = m_ioman->Open(Iop::Ioman::CDevice::OPEN_FLAG_RDONLY, imagePathStart);
+	if(fd < 0) return false;
+
+	Iop::CIoman::CFile file(fd, *m_ioman);
+	auto stream = m_ioman->GetFileStream(file);
+	while(1)
+	{
+		static const unsigned int moduleVersionStringSize = 0x10;
+		char moduleVersionString[moduleVersionStringSize + 1];
+		auto currentPos = stream->Tell();
+		stream->Read(moduleVersionString, moduleVersionStringSize);
+		moduleVersionString[moduleVersionStringSize] = 0;
+		if(!strncmp(moduleVersionString, "PsIIfileio  ", 12))
+		{
+			//Found something
+			unsigned int imageVersion = atoi(moduleVersionString + 12);
+			if(imageVersion < 1000) return false;
+			if(result)
+			{
+				(*result) = imageVersion;
+			}
+			return true;
+		}
+		stream->Seek(currentPos + 1, Framework::STREAM_SEEK_SET);
+	}
+	return false;
 }
 
 CIopBios::THREAD* CIopBios::GetThread(uint32 threadId)
@@ -709,11 +752,29 @@ CIopBios::THREAD* CIopBios::GetThread(uint32 threadId)
 	return m_threads[threadId];
 }
 
+int32 CIopBios::GetCurrentThreadId()
+{
+	int32 threadId = m_currentThreadId;
+	if(threadId < 0)
+	{
+		return KERNEL_RESULT_ERROR_ILLEGAL_CONTEXT;
+	}
+	else
+	{
+		return threadId;
+	}
+}
+
+int32 CIopBios::GetCurrentThreadIdRaw() const
+{
+	return m_currentThreadId;
+}
+
 uint32 CIopBios::CreateThread(uint32 threadProc, uint32 priority, uint32 stackSize, uint32 optionData)
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%d: CreateThread(threadProc = 0x%0.8X, priority = %d, stackSize = 0x%0.8X);\r\n", 
-		CurrentThreadId(), threadProc, priority, stackSize);
+		m_currentThreadId.Get(), threadProc, priority, stackSize);
 #endif
 
 	if(stackSize == 0)
@@ -750,7 +811,7 @@ void CIopBios::DeleteThread(uint32 threadId)
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%d: DeleteThread(threadId = %d);\r\n", 
-		CurrentThreadId(), threadId);
+		m_currentThreadId.Get(), threadId);
 #endif
 	THREAD* thread = m_threads[threadId];
 	UnlinkThread(threadId);
@@ -762,7 +823,7 @@ int32 CIopBios::StartThread(uint32 threadId, uint32 param)
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%i: StartThread(threadId = %i, param = 0x%0.8X);\r\n", 
-		CurrentThreadId(), threadId, param);
+		m_currentThreadId.Get(), threadId, param);
 #endif
 
 	auto thread = GetThread(threadId);
@@ -775,7 +836,7 @@ int32 CIopBios::StartThread(uint32 threadId, uint32 param)
 	if(thread->status != THREAD_STATUS_DORMANT)
 	{
 		CLog::GetInstance().Print(LOGNAME, "%d: Failed to start thread %d, thread not dormant.\r\n",
-			CurrentThreadId(), threadId);
+			m_currentThreadId.Get(), threadId);
 		assert(false);
 		return -1;
 	}
@@ -788,16 +849,7 @@ int32 CIopBios::StartThread(uint32 threadId, uint32 param)
 	thread->context.gpr[CMIPS::RA] = m_threadFinishAddress;
 	thread->context.gpr[CMIPS::SP] = thread->stackBase + thread->stackSize - STACK_FRAME_RESERVE_SIZE;
 
-	// If the thread we are starting is the same priority or lower than the current one, do yield.
-	// If may be that the correct action is never to yield - the docs aren't really clear.
-	// INET.IRX (from Champions: Return to Arms) depends on startThread not yielding when starting a 
-	// thread of the same priority.
-	auto currentThread = GetThread(CurrentThreadId());
-	if((currentThread == nullptr) || (currentThread->priority < thread->priority))
-	{
-		m_rescheduleNeeded = true;
-	}
-
+	m_rescheduleNeeded = true;
 	return 0;
 }
 
@@ -805,7 +857,7 @@ int32 CIopBios::StartThreadArgs(uint32 threadId, uint32 args, uint32 argpPtr)
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%d: StartThreadArgs(threadId = %d, args = %d, argp = 0x%0.8X);\r\n", 
-		CurrentThreadId(), threadId, args, argpPtr);
+		m_currentThreadId.Get(), threadId, args, argpPtr);
 #endif
 
 	auto thread = GetThread(threadId);
@@ -818,7 +870,7 @@ int32 CIopBios::StartThreadArgs(uint32 threadId, uint32 args, uint32 argpPtr)
 	if(thread->status != THREAD_STATUS_DORMANT)
 	{
 		CLog::GetInstance().Print(LOGNAME, "%d: Failed to start thread %d, thread not dormant.\r\n",
-			CurrentThreadId(), threadId);
+			m_currentThreadId.Get(), threadId);
 		assert(false);
 		return -1;
 	}
@@ -845,21 +897,16 @@ int32 CIopBios::StartThreadArgs(uint32 threadId, uint32 args, uint32 argpPtr)
 
 	thread->context.gpr[CMIPS::SP] -= STACK_FRAME_RESERVE_SIZE;
 
-	auto currentThread = GetThread(CurrentThreadId());
-	if((currentThread == nullptr) || (currentThread->priority < thread->priority))
-	{
-		m_rescheduleNeeded = true;
-	}
-
+	m_rescheduleNeeded = true;
 	return 0;
 }
 
 void CIopBios::ExitThread()
 {
 #ifdef _DEBUG
-	CLog::GetInstance().Print(LOGNAME, "%i: ExitThread();\r\n", CurrentThreadId());
+	CLog::GetInstance().Print(LOGNAME, "%i: ExitThread();\r\n", m_currentThreadId.Get());
 #endif
-	THREAD* thread = GetThread(CurrentThreadId());
+	THREAD* thread = GetThread(m_currentThreadId);
 	thread->status = THREAD_STATUS_DORMANT;
 	UnlinkThread(thread->id);
 	m_rescheduleNeeded = true;
@@ -869,10 +916,10 @@ uint32 CIopBios::TerminateThread(uint32 threadId)
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%d: TerminateThread(threadId = %d);\r\n", 
-		CurrentThreadId(), threadId);
+		m_currentThreadId.Get(), threadId);
 #endif
 
-	assert(threadId != CurrentThreadId());
+	assert(threadId != m_currentThreadId);
 	auto thread = GetThread(threadId);
 	assert(thread != nullptr);
 	if(thread == nullptr)
@@ -898,10 +945,10 @@ void CIopBios::DelayThread(uint32 delay)
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%i: DelayThread(delay = %i);\r\n", 
-		CurrentThreadId(), delay);
+		m_currentThreadId.Get(), delay);
 #endif
 
-	THREAD* thread = GetThread(CurrentThreadId());
+	THREAD* thread = GetThread(m_currentThreadId);
 	thread->nextActivateTime = GetCurrentTime() + MicroSecToClock(delay);
 	//TODO: Add a proper wait state to allow thread to be relinked
 	//at the end of the queue at the right moment
@@ -912,7 +959,7 @@ void CIopBios::DelayThread(uint32 delay)
 
 void CIopBios::DelayThreadTicks(uint32 delay)
 {
-	auto thread = GetThread(CurrentThreadId());
+	auto thread = GetThread(m_currentThreadId);
 	thread->nextActivateTime = GetCurrentTime() + delay;
 	//TODO: Add a proper wait state to allow thread to be relinked
 	//at the end of the queue at the right moment
@@ -980,7 +1027,7 @@ uint32 CIopBios::CancelAlarm(uint32 alarmFunction, uint32 param)
 	if(alarmThreadId == -1)
 	{
 		// handler not registered
-		return -105;
+		return KERNEL_RESULT_ERROR_NOTFOUND_HANDLER;
 	}
 
 	TerminateThread(alarmThreadId);
@@ -991,12 +1038,12 @@ void CIopBios::ChangeThreadPriority(uint32 threadId, uint32 newPrio)
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%d: ChangeThreadPriority(threadId = %d, newPrio = %d);\r\n", 
-		CurrentThreadId(), threadId, newPrio);
+		m_currentThreadId.Get(), threadId, newPrio);
 #endif
 
 	if(threadId == 0)
 	{
-		threadId = GetCurrentThreadId();
+		threadId = m_currentThreadId;
 	}
 
 	THREAD* thread = GetThread(threadId);
@@ -1011,52 +1058,96 @@ void CIopBios::ChangeThreadPriority(uint32 threadId, uint32 newPrio)
 	m_rescheduleNeeded = true;
 }
 
-uint32 CIopBios::ReferThreadStatus(uint32 threadId, uint32 statusPtr)
+uint32 CIopBios::ReferThreadStatus(uint32 threadId, uint32 statusPtr, bool inInterrupt)
 {
 #ifdef _DEBUG
-	CLog::GetInstance().Print(LOGNAME, "%d: ReferThreadStatus(threadId = %d, statusPtr = 0x%0.8X);\r\n", 
-		CurrentThreadId(), threadId, statusPtr);
+	CLog::GetInstance().Print(LOGNAME, "%d: ReferThreadStatus(threadId = %d, statusPtr = 0x%0.8X, inInterrupt = %d);\r\n", 
+		m_currentThreadId.Get(), threadId, statusPtr, inInterrupt);
 #endif
 
 	if(threadId == 0)
 	{
-		threadId = GetCurrentThreadId();
+		threadId = m_currentThreadId;
 	}
 
-	THREAD* thread = GetThread(threadId);
-	assert(thread != NULL);
-
-	if(thread == NULL)
+	auto thread = m_threads[threadId];
+	assert(thread);
+	if(!thread)
 	{
-		return -1;
+		return KERNEL_RESULT_ERROR_UNKNOWN_THID;
 	}
 
 	uint32 threadStatus = 0;
-	if(thread->status == THREAD_STATUS_DORMANT)
+	switch(thread->status)
 	{
-		threadStatus |= 0x10;
+	case THREAD_STATUS_DORMANT:
+		threadStatus = 0x10;
+		break;
+	case THREAD_STATUS_SLEEPING:
+	case THREAD_STATUS_WAITING_MESSAGEBOX:
+	case THREAD_STATUS_WAITING_EVENTFLAG:
+	case THREAD_STATUS_WAITING_SEMAPHORE:
+	case THREAD_STATUS_WAIT_VBLANK_START:
+	case THREAD_STATUS_WAIT_VBLANK_END:
+		threadStatus = 0x04;
+		break;
+	case THREAD_STATUS_RUNNING:
+		if(threadId == m_currentThreadId)
+		{
+			threadStatus = 0x01;
+		}
+		else
+		{
+			threadStatus = 0x02;
+		}
+		break;
+	default:
+		threadStatus = 0;
+		break;
 	}
 
-	reinterpret_cast<uint32*>(m_ram + statusPtr)[THREAD_INFO_ATTRIBUTE]		= 0;
-	reinterpret_cast<uint32*>(m_ram + statusPtr)[THREAD_INFO_OPTION]		= thread->optionData;
-	reinterpret_cast<uint32*>(m_ram + statusPtr)[THREAD_INFO_STATUS]		= threadStatus;
-	reinterpret_cast<uint32*>(m_ram + statusPtr)[THREAD_INFO_THREAD]		= thread->threadProc;
-	reinterpret_cast<uint32*>(m_ram + statusPtr)[THREAD_INFO_STACK]			= thread->stackBase;
-	reinterpret_cast<uint32*>(m_ram + statusPtr)[THREAD_INFO_STACKSIZE]		= thread->stackSize;
-	reinterpret_cast<uint32*>(m_ram + statusPtr)[THREAD_INFO_INITPRIORITY]	= thread->initPriority;
-	reinterpret_cast<uint32*>(m_ram + statusPtr)[THREAD_INFO_PRIORITY]		= thread->priority;
+	uint32 waitType = 0;
+	switch(thread->status)
+	{
+	case THREAD_STATUS_SLEEPING:
+		waitType = 1;
+		break;
+	case THREAD_STATUS_WAITING_SEMAPHORE:
+		waitType = 3;
+		break;
+	case THREAD_STATUS_WAITING_EVENTFLAG:
+		waitType = 4;
+		break;
+	case THREAD_STATUS_WAITING_MESSAGEBOX:
+		waitType = 5;
+		break;
+	default:
+		waitType = 0;
+		break;
+	}
 
-	return 0;
+	auto threadInfo = reinterpret_cast<THREAD_INFO*>(m_ram + statusPtr);
+	threadInfo->attributes      = 0;
+	threadInfo->option          = thread->optionData;
+	threadInfo->status          = threadStatus;
+	threadInfo->entryPoint      = thread->threadProc;
+	threadInfo->stackAddr       = thread->stackBase;
+	threadInfo->stackSize       = thread->stackSize;
+	threadInfo->initPriority    = thread->initPriority;
+	threadInfo->currentPriority = thread->priority;
+	threadInfo->waitType        = waitType;
+
+	return KERNEL_RESULT_OK;
 }
 
 void CIopBios::SleepThread()
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%i: SleepThread();\r\n", 
-		CurrentThreadId());
+		m_currentThreadId.Get());
 #endif
 
-	THREAD* thread = GetThread(CurrentThreadId());
+	THREAD* thread = GetThread(m_currentThreadId);
 	if(thread->status != THREAD_STATUS_RUNNING)
 	{
 		throw std::runtime_error("Thread isn't running.");
@@ -1077,7 +1168,7 @@ uint32 CIopBios::WakeupThread(uint32 threadId, bool inInterrupt)
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%d: WakeupThread(threadId = %d);\r\n", 
-		CurrentThreadId(), threadId);
+		m_currentThreadId.Get(), threadId);
 #endif
 
 	THREAD* thread = GetThread(threadId);
@@ -1099,7 +1190,7 @@ uint32 CIopBios::WakeupThread(uint32 threadId, bool inInterrupt)
 
 void CIopBios::SleepThreadTillVBlankStart()
 {
-	THREAD* thread = GetThread(CurrentThreadId());
+	THREAD* thread = GetThread(m_currentThreadId);
 	thread->status = THREAD_STATUS_WAIT_VBLANK_START;
 	UnlinkThread(thread->id);
 	m_rescheduleNeeded = true;
@@ -1107,15 +1198,10 @@ void CIopBios::SleepThreadTillVBlankStart()
 
 void CIopBios::SleepThreadTillVBlankEnd()
 {
-	THREAD* thread = GetThread(CurrentThreadId());
+	THREAD* thread = GetThread(m_currentThreadId);
 	thread->status = THREAD_STATUS_WAIT_VBLANK_END;
 	UnlinkThread(thread->id);
 	m_rescheduleNeeded = true;
-}
-
-uint32 CIopBios::GetCurrentThreadId() const
-{
-	return CurrentThreadId();
 }
 
 void CIopBios::LoadThreadContext(uint32 threadId)
@@ -1197,9 +1283,9 @@ void CIopBios::Reschedule()
 		return;
 	}
 
-	if(CurrentThreadId() != -1)
+	if(m_currentThreadId != -1)
 	{
-		SaveThreadContext(CurrentThreadId());
+		SaveThreadContext(m_currentThreadId);
 	}
 
 	uint32 nextThreadId = GetNextReadyThread();
@@ -1212,12 +1298,12 @@ void CIopBios::Reschedule()
 		LoadThreadContext(nextThreadId);
 	}
 #ifdef _DEBUG
-	if(nextThreadId != CurrentThreadId())
+	if(nextThreadId != m_currentThreadId)
 	{
 		CLog::GetInstance().Print(LOGNAME, "Switched over to thread %i.\r\n", nextThreadId);
 	}
 #endif
-	CurrentThreadId() = nextThreadId;
+	m_currentThreadId = nextThreadId;
 }
 
 uint32 CIopBios::GetNextReadyThread()
@@ -1292,7 +1378,7 @@ uint32 CIopBios::CreateSemaphore(uint32 initialCount, uint32 maxCount)
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%i: CreateSemaphore(initialCount = %i, maxCount = %i);\r\n", 
-		CurrentThreadId(), initialCount, maxCount);
+		m_currentThreadId.Get(), initialCount, maxCount);
 #endif
 
 	uint32 semaphoreId = m_semaphores.Allocate();
@@ -1316,14 +1402,14 @@ uint32 CIopBios::DeleteSemaphore(uint32 semaphoreId)
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%i: DeleteSemaphore(semaphoreId = %i);\r\n",
-		CurrentThreadId(), semaphoreId);
+		m_currentThreadId.Get(), semaphoreId);
 #endif
 
 	SEMAPHORE* semaphore = m_semaphores[semaphoreId];
 	if(semaphore == NULL)
 	{
 		CLog::GetInstance().Print(LOGNAME, "%i: Warning, trying to access invalid semaphore with id %i.\r\n",
-			CurrentThreadId(), semaphoreId);
+			m_currentThreadId.Get(), semaphoreId);
 		return -1;
 	}
 
@@ -1337,14 +1423,14 @@ uint32 CIopBios::SignalSemaphore(uint32 semaphoreId, bool inInterrupt)
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%d: SignalSemaphore(semaphoreId = %d, inInterrupt = %d);\r\n", 
-		CurrentThreadId(), semaphoreId, inInterrupt);
+		m_currentThreadId.Get(), semaphoreId, inInterrupt);
 #endif
 
 	SEMAPHORE* semaphore = m_semaphores[semaphoreId];
 	if(semaphore == NULL)
 	{
 		CLog::GetInstance().Print(LOGNAME, "%d: Warning, trying to access invalid semaphore with id %d.\r\n",
-			CurrentThreadId(), semaphoreId);
+			m_currentThreadId.Get(), semaphoreId);
 		return -1;
 	}
 
@@ -1385,20 +1471,20 @@ uint32 CIopBios::WaitSemaphore(uint32 semaphoreId)
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%d: WaitSemaphore(semaphoreId = %d);\r\n", 
-		CurrentThreadId(), semaphoreId);
+		m_currentThreadId.Get(), semaphoreId);
 #endif
 
 	SEMAPHORE* semaphore = m_semaphores[semaphoreId];
 	if(semaphore == NULL)
 	{
 		CLog::GetInstance().Print(LOGNAME, "%d: Warning, trying to access invalid semaphore with id %d.\r\n",
-			CurrentThreadId(), semaphoreId);
+			m_currentThreadId.Get(), semaphoreId);
 		return -1;
 	}
 
 	if(semaphore->count == 0)
 	{
-		uint32 threadId = CurrentThreadId();
+		uint32 threadId = m_currentThreadId;
 		THREAD* thread = GetThread(threadId);
 		thread->status			= THREAD_STATUS_WAITING_SEMAPHORE;
 		thread->waitSemaphore	= semaphoreId;
@@ -1416,7 +1502,7 @@ uint32 CIopBios::WaitSemaphore(uint32 semaphoreId)
 uint32 CIopBios::PollSemaphore(uint32 semaphoreId)
 {
 	CLog::GetInstance().Print(LOGNAME, "%d: PollSemaphore(semaphoreId = %d);\r\n", 
-		CurrentThreadId(), semaphoreId);
+		m_currentThreadId.Get(), semaphoreId);
 
 	auto semaphore = m_semaphores[semaphoreId];
 	if(semaphore == nullptr)
@@ -1437,7 +1523,7 @@ uint32 CIopBios::PollSemaphore(uint32 semaphoreId)
 uint32 CIopBios::ReferSemaphoreStatus(uint32 semaphoreId, uint32 statusPtr)
 {
 	CLog::GetInstance().Print(LOGNAME, "%d: ReferSemaphoreStatus(semaphoreId = %d, statusPtr = 0x%0.8X);\r\n", 
-		CurrentThreadId(), semaphoreId, statusPtr);
+		m_currentThreadId.Get(), semaphoreId, statusPtr);
 
 	auto semaphore = m_semaphores[semaphoreId];
 	if(semaphore == nullptr)
@@ -1460,7 +1546,7 @@ uint32 CIopBios::CreateEventFlag(uint32 attributes, uint32 options, uint32 initV
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%d: CreateEventFlag(attr = 0x%0.8X, opt = 0x%0.8X, initValue = 0x%0.8X);\r\n",
-		CurrentThreadId(), attributes, options, initValue);
+		m_currentThreadId.Get(), attributes, options, initValue);
 #endif
 
 	uint32 eventId = m_eventFlags.Allocate();
@@ -1484,7 +1570,7 @@ uint32 CIopBios::SetEventFlag(uint32 eventId, uint32 value, bool inInterrupt)
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%d: SetEventFlag(eventId = %d, value = 0x%0.8X, inInterrupt = %d);\r\n",
-		CurrentThreadId(), eventId, value, inInterrupt);
+		m_currentThreadId.Get(), eventId, value, inInterrupt);
 #endif
 
 	auto eventFlag = m_eventFlags[eventId];
@@ -1527,7 +1613,7 @@ uint32 CIopBios::ClearEventFlag(uint32 eventId, uint32 value)
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%d: ClearEventFlag(eventId = %d, value = 0x%0.8X);\r\n",
-		CurrentThreadId(), eventId, value);
+		m_currentThreadId.Get(), eventId, value);
 #endif
 
 	EVENTFLAG* eventFlag = m_eventFlags[eventId];
@@ -1545,7 +1631,7 @@ uint32 CIopBios::WaitEventFlag(uint32 eventId, uint32 value, uint32 mode, uint32
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%d: WaitEventFlag(eventId = %d, value = 0x%0.8X, mode = 0x%0.2X, resultPtr = 0x%0.8X);\r\n",
-		CurrentThreadId(), eventId, value, mode, resultPtr);
+		m_currentThreadId.Get(), eventId, value, mode, resultPtr);
 #endif
 
 	auto eventFlag = m_eventFlags[eventId];
@@ -1558,7 +1644,7 @@ uint32 CIopBios::WaitEventFlag(uint32 eventId, uint32 value, uint32 mode, uint32
 		(resultPtr != 0) ? reinterpret_cast<uint32*>(m_ram + resultPtr) : nullptr);
 	if(!success)
 	{
-		auto thread = GetThread(CurrentThreadId());
+		auto thread = GetThread(m_currentThreadId);
 		thread->status					= THREAD_STATUS_WAITING_EVENTFLAG;
 		UnlinkThread(thread->id);
 		thread->waitEventFlag			= eventId;
@@ -1575,7 +1661,7 @@ uint32 CIopBios::ReferEventFlagStatus(uint32 eventId, uint32 infoPtr)
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%d: ReferEventFlagStatus(eventId = %d, infoPtr = 0x%0.8X);\r\n",
-		CurrentThreadId(), eventId, infoPtr);
+		m_currentThreadId.Get(), eventId, infoPtr);
 #endif
 
 	EVENTFLAG* eventFlag = m_eventFlags[eventId];
@@ -1633,7 +1719,7 @@ uint32 CIopBios::CreateMessageBox()
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%d: CreateMessageBox();\r\n",
-		CurrentThreadId());
+		m_currentThreadId.Get());
 #endif
 
 	uint32 boxId = m_messageBoxes.Allocate();
@@ -1643,10 +1729,29 @@ uint32 CIopBios::CreateMessageBox()
 		return -1;
 	}
 
-	MESSAGEBOX* box = m_messageBoxes[boxId];
+	auto box = m_messageBoxes[boxId];
 	box->nextMsgPtr = 0;
+	box->numMessage = 0;
 
 	return boxId;
+}
+
+uint32 CIopBios::DeleteMessageBox(uint32 boxId)
+{
+#ifdef _DEBUG
+	CLog::GetInstance().Print(LOGNAME, "%d: DeleteMessageBox(boxId = %d);\r\n",
+		m_currentThreadId.Get(), boxId);
+#endif
+
+	auto box = m_messageBoxes[boxId];
+	if(!box)
+	{
+		return KERNEL_RESULT_ERROR_UNKNOWN_MBXID;
+	}
+
+	m_messageBoxes.Free(boxId);
+
+	return KERNEL_RESULT_OK;
 }
 
 uint32 CIopBios::SendMessageBox(uint32 boxId, uint32 messagePtr)
@@ -1655,13 +1760,13 @@ uint32 CIopBios::SendMessageBox(uint32 boxId, uint32 messagePtr)
 
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%d: SendMessageBox(boxId = %d, messagePtr = 0x%0.8X, inInterrupt = %d);\r\n",
-		CurrentThreadId(), boxId, messagePtr, inInterrupt);
+		m_currentThreadId.Get(), boxId, messagePtr, inInterrupt);
 #endif
 
-	MESSAGEBOX* box = m_messageBoxes[boxId];
-	if(box == NULL)
+	auto box = m_messageBoxes[boxId];
+	if(!box)
 	{
-		return -1;
+		return KERNEL_RESULT_ERROR_UNKNOWN_MBXID;
 	}
 
 	//Check if there's a thread waiting for a message first
@@ -1687,34 +1792,57 @@ uint32 CIopBios::SendMessageBox(uint32 boxId, uint32 messagePtr)
 				m_rescheduleNeeded = true;
 			}
 			
-			return 0;
+			return KERNEL_RESULT_OK;
 		}
 	}
 
-	assert(0);
-	return 0;
+	auto header = reinterpret_cast<MESSAGE_HEADER*>(m_ram + messagePtr);
+	header->nextMsgPtr = 0;
+
+	auto msgPtr = &box->nextMsgPtr;
+	while(1)
+	{
+		if((*msgPtr) == 0)
+		{
+			(*msgPtr) = messagePtr;
+			break;
+		}
+		msgPtr = reinterpret_cast<uint32*>(m_ram + *msgPtr);
+	}
+
+	box->numMessage++;
+
+	return KERNEL_RESULT_OK;
 }
 
 uint32 CIopBios::ReceiveMessageBox(uint32 messagePtr, uint32 boxId)
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%d: ReceiveMessageBox(messagePtr = 0x%0.8X, boxId = %d);\r\n",
-		CurrentThreadId(), messagePtr, boxId);
+		m_currentThreadId.Get(), messagePtr, boxId);
 #endif
 
-	MESSAGEBOX* box = m_messageBoxes[boxId];
-	if(box == NULL)
+	auto box = m_messageBoxes[boxId];
+	if(!box)
 	{
-		return -1;
+		return KERNEL_RESULT_ERROR_UNKNOWN_MBXID;
 	}
 
 	if(box->nextMsgPtr != 0)
 	{
-		assert(0);
+		assert(box->numMessage > 0);
+
+		uint32* message = reinterpret_cast<uint32*>(m_ram + messagePtr);
+		(*message) = box->nextMsgPtr;
+
+		//Unlink message
+		auto header = reinterpret_cast<MESSAGE_HEADER*>(m_ram + box->nextMsgPtr);
+		box->nextMsgPtr = header->nextMsgPtr;
+		box->numMessage--;
 	}
 	else
 	{
-		THREAD* thread = GetThread(CurrentThreadId());
+		THREAD* thread = GetThread(m_currentThreadId);
 		thread->status					= THREAD_STATUS_WAITING_MESSAGEBOX;
 		UnlinkThread(thread->id);
 		thread->waitMessageBox			= boxId;
@@ -1722,14 +1850,14 @@ uint32 CIopBios::ReceiveMessageBox(uint32 messagePtr, uint32 boxId)
 		m_rescheduleNeeded = true;
 	}
 
-	return 0;
+	return KERNEL_RESULT_OK;
 }
 
 uint32 CIopBios::PollMessageBox(uint32 messagePtr, uint32 boxId)
 {
 #ifdef _DEBUG
 	CLog::GetInstance().Print(LOGNAME, "%d: PollMessageBox(messagePtr = 0x%0.8X, boxId = %d);\r\n",
-		CurrentThreadId(), messagePtr, boxId);
+		m_currentThreadId.Get(), messagePtr, boxId);
 #endif
 
 	MESSAGEBOX* box = m_messageBoxes[boxId];
@@ -1745,6 +1873,29 @@ uint32 CIopBios::PollMessageBox(uint32 messagePtr, uint32 boxId)
 
 	assert(0);
 	return 0;
+}
+
+uint32 CIopBios::ReferMessageBoxStatus(uint32 boxId, uint32 statusPtr)
+{
+#ifdef _DEBUG
+	CLog::GetInstance().Print(LOGNAME, "%d: ReferMessageBox(boxId = %d, statusPtr = 0x%0.8X);\r\n",
+		m_currentThreadId.Get(), boxId, statusPtr);
+#endif
+
+	auto box = m_messageBoxes[boxId];
+	if(!box)
+	{
+		return KERNEL_RESULT_ERROR_UNKNOWN_MBXID;
+	}
+
+	auto status = reinterpret_cast<MESSAGEBOX_STATUS*>(m_ram + statusPtr);
+	status->attr          = 0;
+	status->option        = 0;
+	status->numMessage    = box->numMessage;
+	status->numWaitThread = 0;
+	status->messagePtr    = box->nextMsgPtr;
+
+	return KERNEL_RESULT_OK;
 }
 
 Iop::CIoman* CIopBios::GetIoman()
@@ -1776,35 +1927,56 @@ Iop::CCdvdfsv* CIopBios::GetCdvdfsv()
 
 #endif
 
-bool CIopBios::RegisterIntrHandler(uint32 line, uint32 mode, uint32 handler, uint32 arg)
+int32 CIopBios::RegisterIntrHandler(uint32 line, uint32 mode, uint32 handler, uint32 arg)
 {
 	assert(FindIntrHandler(line) == -1);
+	if(FindIntrHandler(line) != -1)
+	{
+		return KERNEL_RESULT_ERROR_FOUND_HANDLER;
+	}
+
+	if(line >= Iop::CIntc::LINES_MAX)
+	{
+		return KERNEL_RESULT_ERROR_ILLEGAL_INTRCODE;
+	}
+
+	//Registering a null handler is a no-op
+	if(handler == 0)
+	{
+		return KERNEL_RESULT_OK;
+	}
 
 	uint32 handlerId = m_intrHandlers.Allocate();
 	assert(handlerId != -1);
 	if(handlerId == -1)
 	{
-		return false;
+		return KERNEL_RESULT_ERROR;
 	}
 
-	INTRHANDLER* intrHandler = m_intrHandlers[handlerId];
+	auto intrHandler = m_intrHandlers[handlerId];
 	intrHandler->line		= line;
 	intrHandler->mode		= mode;
 	intrHandler->handler	= handler;
 	intrHandler->arg		= arg;
 
-	return true;
+	return KERNEL_RESULT_OK;
 }
 
-bool CIopBios::ReleaseIntrHandler(uint32 line)
+int32 CIopBios::ReleaseIntrHandler(uint32 line)
 {
+	if(line >= Iop::CIntc::LINES_MAX)
+	{
+		return KERNEL_RESULT_ERROR_ILLEGAL_INTRCODE;
+	}
+
 	uint32 handlerId = FindIntrHandler(line);
 	if(handlerId == -1)
 	{
-		return false;
+		return KERNEL_RESULT_ERROR_NOTFOUND_HANDLER;
 	}
+
 	m_intrHandlers.Free(handlerId);
-	return true;
+	return KERNEL_RESULT_OK;
 }
 
 uint32 CIopBios::FindIntrHandler(uint32 line)
@@ -2019,11 +2191,11 @@ void CIopBios::HandleInterrupt()
 			else
 			{
 				//Snap out of current thread
-				if(CurrentThreadId() != -1)
+				if(m_currentThreadId != -1)
 				{
-					SaveThreadContext(CurrentThreadId());
+					SaveThreadContext(m_currentThreadId);
 				}
-				CurrentThreadId() = -1;
+				m_currentThreadId = -1;
 				INTRHANDLER* handler = m_intrHandlers[handlerId];
 				m_cpu.m_State.nPC = handler->handler;
 				m_cpu.m_State.nGPR[CMIPS::SP].nD0 -= STACK_FRAME_RESERVE_SIZE;
@@ -2351,7 +2523,7 @@ BiosDebugThreadInfoArray CIopBios::GetThreadsDebugInfo() const
 		BIOS_DEBUG_THREAD_INFO threadInfo;
 		threadInfo.id			= thread->id;
 		threadInfo.priority		= thread->priority;
-		if(GetCurrentThreadId() == threadInfo.id)
+		if(m_currentThreadId == threadInfo.id)
 		{
 			threadInfo.pc = m_cpu.m_State.nPC;
 			threadInfo.ra = m_cpu.m_State.nGPR[CMIPS::RA].nV0;

@@ -1,5 +1,6 @@
 #include <cassert>
 #include <cmath>
+#include <climits>
 #include "string_format.h"
 #include "../Log.h"
 #include "../RegisterStateFile.h"
@@ -289,6 +290,11 @@ void CSpuBase::SetBaseSamplingRate(uint32 samplingRate)
 bool CSpuBase::GetIrqPending() const
 {
 	return m_irqPending;
+}
+
+void CSpuBase::ClearIrqPending()
+{
+	m_irqPending = false;
 }
 
 uint32 CSpuBase::GetIrqAddress() const

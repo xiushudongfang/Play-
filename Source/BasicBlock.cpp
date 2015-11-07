@@ -23,14 +23,18 @@
 
 #ifdef AOT_USE_CACHE
 
+#pragma pack(push, 1)
 struct AOT_BLOCK
 {
 	AOT_BLOCK_KEY	key;
 	void*			fct;
 };
+#pragma pack(pop)
 
-extern "C" AOT_BLOCK	_aot_firstBlock;
-extern "C" uint32		_aot_blockCount;
+extern "C" {
+	extern AOT_BLOCK _aot_firstBlock;
+	extern uint32 _aot_blockCount;
+}
 
 #endif
 

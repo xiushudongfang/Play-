@@ -6,6 +6,7 @@
 #include "../MIPS.h"
 #include "../ELF.h"
 #include "../OsStructManager.h"
+#include "../OsVariableWrapper.h"
 #include "Iop_BiosBase.h"
 #include "Iop_SifMan.h"
 #include "Iop_SifCmd.h"
@@ -75,16 +76,22 @@ public:
 		THREAD_STATUS_WAIT_VBLANK_END		= 8,
 	};
 
-	enum THREAD_STATUS_OFFSETS
+	struct THREAD_INFO
 	{
-		THREAD_INFO_ATTRIBUTE				= 0,
-		THREAD_INFO_OPTION					= 1,
-		THREAD_INFO_STATUS					= 2,
-		THREAD_INFO_THREAD					= 3,
-		THREAD_INFO_STACK					= 4,
-		THREAD_INFO_STACKSIZE				= 5,
-		THREAD_INFO_INITPRIORITY			= 7,
-		THREAD_INFO_PRIORITY				= 8
+		uint32 attributes;
+		uint32 option;
+		uint32 status;
+		uint32 entryPoint;
+		uint32 stackAddr;
+		uint32 stackSize;
+		uint32 gp;
+		uint32 initPriority;
+		uint32 currentPriority;
+		uint32 waitType;
+		uint32 waitId;
+		uint32 wakeupCount;
+		uint32 regContextAddr;
+		uint32 reserved[4];
 	};
 
 								CIopBios(CMIPS&, uint8*, uint32);
@@ -94,10 +101,13 @@ public:
 	int32						LoadModule(uint32);
 	int32						LoadModuleFromHost(uint8*);
 	int32						UnloadModule(uint32);
-	int32						StartModule(uint32, const char*, const char*, unsigned int);
+	int32						StartModule(uint32, const char*, const char*, uint32);
 	int32						StopModule(uint32);
 	int32						SearchModuleByName(const char*) const;
 	void						ProcessModuleReset(const std::string&);
+
+	bool						TryGetImageVersionFromPath(const std::string&, unsigned int*);
+	bool						TryGetImageVersionFromContents(const std::string&, unsigned int*);
 
 	void						HandleException();
 	void						HandleInterrupt();
@@ -140,9 +150,10 @@ public:
 	uint32						SetAlarm(uint32, uint32, uint32);
 	uint32						CancelAlarm(uint32, uint32);
 	THREAD*						GetThread(uint32);
-	uint32						GetCurrentThreadId() const;
+	int32						GetCurrentThreadId();
+	int32						GetCurrentThreadIdRaw() const;
 	void						ChangeThreadPriority(uint32, uint32);
-	uint32						ReferThreadStatus(uint32, uint32);
+	uint32						ReferThreadStatus(uint32, uint32, bool);
 	void						SleepThread();
 	uint32						WakeupThread(uint32, bool);
 
@@ -164,12 +175,14 @@ public:
 	bool						ProcessEventFlag(uint32, uint32&, uint32, uint32*);
 
 	uint32						CreateMessageBox();
+	uint32						DeleteMessageBox(uint32);
 	uint32						SendMessageBox(uint32, uint32);
 	uint32						ReceiveMessageBox(uint32, uint32);
 	uint32						PollMessageBox(uint32, uint32);
+	uint32						ReferMessageBoxStatus(uint32, uint32);
 
-	bool						RegisterIntrHandler(uint32, uint32, uint32, uint32);
-	bool						ReleaseIntrHandler(uint32);
+	int32						RegisterIntrHandler(uint32, uint32, uint32, uint32);
+	int32						ReleaseIntrHandler(uint32);
 
 	void						TriggerCallback(uint32 address, uint32 arg0, uint32 arg1);
 
@@ -194,6 +207,11 @@ private:
 	enum DEFAULT_PRIORITY
 	{
 		DEFAULT_PRIORITY = 64,
+	};
+
+	enum MODULE_INIT_PRIORITY
+	{
+		MODULE_INIT_PRIORITY = 8,
 	};
 
 	enum class MODULE_STATE : uint32
@@ -267,6 +285,24 @@ private:
 	{
 		uint32			isValid;
 		uint32			nextMsgPtr;
+		uint32			numMessage;
+	};
+
+	struct MESSAGEBOX_STATUS
+	{
+		uint32			attr;
+		uint32			option;
+		uint32			numWaitThread;
+		uint32			numMessage;
+		uint32			messagePtr;
+		uint32			unused[2];
+	};
+
+	struct MESSAGE_HEADER
+	{
+		uint32			nextMsgPtr;
+		uint8			priority;
+		uint8			unused[3];
 	};
 
 	struct SEMAPHORE_STATUS
@@ -328,6 +364,18 @@ private:
 		IOPMOD_SECTION_ID = 0x70000080,
 	};
 
+	enum KERNEL_RESULT_CODES
+	{
+		KERNEL_RESULT_OK                     =    0,
+		KERNEL_RESULT_ERROR                  =   -1,
+		KERNEL_RESULT_ERROR_ILLEGAL_CONTEXT  = -100,
+		KERNEL_RESULT_ERROR_ILLEGAL_INTRCODE = -101,
+		KERNEL_RESULT_ERROR_FOUND_HANDLER    = -104,
+		KERNEL_RESULT_ERROR_NOTFOUND_HANDLER = -105,
+		KERNEL_RESULT_ERROR_UNKNOWN_THID     = -407,
+		KERNEL_RESULT_ERROR_UNKNOWN_MBXID    = -410,
+	};
+
 	typedef COsStructManager<THREAD> ThreadList;
 	typedef COsStructManager<SEMAPHORE> SemaphoreList;
 	typedef COsStructManager<EVENTFLAG> EventFlagList;
@@ -342,7 +390,6 @@ private:
 	void							RegisterModule(Iop::CModule*);
 	void							ClearDynamicModules();
 
-	void							ExitCurrentThread();
 	void							LoadThreadContext(uint32);
 	void							SaveThreadContext(uint32);
 	uint32							GetNextReadyThread();
@@ -354,7 +401,6 @@ private:
 	void							UnlinkThread(uint32);
 
 	uint32&							ThreadLinkHead() const;
-	uint32&							CurrentThreadId() const;
 	uint64&							CurrentTime() const;
 	uint32&							ModuleStartRequestHead() const;
 	uint32&							ModuleStartRequestFree() const;
@@ -404,6 +450,8 @@ private:
 
 	IopModuleMapType				m_modules;
 	DynamicIopModuleListType		m_dynamicModules;
+
+	OsVariableWrapper<uint32>		m_currentThreadId;
 
 #ifdef DEBUGGER_INCLUDED
 	BiosDebugModuleInfoArray		m_moduleTags;
